@@ -447,18 +447,9 @@ def optimize_fund_allocation(data, total_fund_crore, priority_weight, disease_we
     pool_a_total = remaining_fund * (op_continuity_pct / 100)
     pool_b_total = remaining_fund * (1 - op_continuity_pct / 100)
 
-    # 2. Pool A: Operational Continuity (Based on existing infrastructure size)
-    # Estimate total bed count: beds/1000 * (population_crore * 10000000 / 1000)
-    # Which simplifies to: beds/1000 * population_crore * 10000
-    state_beds = allocation["hospital_beds_per_1000"] * allocation["population_crore"] * 10000
-    total_beds = max(1.0, state_beds.sum())
-    total_doctors = max(1.0, allocation["doctors_total"].sum())
-
-    state_beds_share = state_beds / total_beds
-    state_doctors_share = allocation["doctors_total"] / total_doctors
-    
-    # Combined operational size index (50% doctor capacity, 50% bed capacity)
-    allocation["pool_a_share"] = state_beds_share * 0.5 + state_doctors_share * 0.5
+    # 2. Pool A: Operational Continuity (Based on state's existing health budget scale)
+    total_existing_budgets = max(1.0, allocation["health_budget_crore"].sum())
+    allocation["pool_a_share"] = allocation["health_budget_crore"] / total_existing_budgets
     allocation["pool_a_allocation"] = pool_a_total * allocation["pool_a_share"]
 
     # 3. Pool B: Development & Equity (Based on priority, disease and infra weights)
@@ -1405,7 +1396,7 @@ with tab5:
         f'<div style="font-size:0.88rem; color:#CAF0F8; background-color:rgba(0,180,216,0.1); padding:12px; border-radius:5px; margin-bottom:20px; border-left:4px solid #00B4D8; line-height:1.4;">'
         f'<b>🎯 Fund Pool Split Details:</b><br>'
         f'• Base Floor Guarantee: <b>₹{allocated_floor_total:,.0f} Cr</b> (₹{effective_floor_val:.0f} Cr/state)<br>'
-        f'• Pool A (Operational Continuity - {op_continuity_pct}%): <b>₹{pool_a_total_val:,.0f} Cr</b> (Based on active doctors & beds to sustain baseline operations)<br>'
+        f'• Pool A (Operational Continuity - {op_continuity_pct}%): <b>₹{pool_a_total_val:,.0f} Cr</b> (Based on existing state health budgets to sustain baseline operations)<br>'
         f'• Pool B (Development & Equity - {100-op_continuity_pct}%): <b>₹{pool_b_total_val:,.0f} Cr</b> (Distributed based on priority weights to target gaps)'
         f'</div>',
         unsafe_allow_html=True
