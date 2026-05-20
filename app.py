@@ -320,6 +320,147 @@ def format_number(n):
     return str(int(n))
 
 
+STATE_COORDS = {
+    "Andaman and Nicobar Islands": (11.7401, 92.6586),
+    "Andhra Pradesh": (15.9129, 79.7400),
+    "Arunachal Pradesh": (28.2180, 94.7278),
+    "Assam": (26.2006, 92.9376),
+    "Bihar": (25.0961, 85.3131),
+    "Chandigarh": (30.7333, 76.7794),
+    "Chhattisgarh": (21.2787, 81.8661),
+    "Dadra Nagar Haveli and Daman Diu": (20.4283, 72.8397),
+    "Delhi": (28.7041, 77.1025),
+    "Goa": (15.2993, 74.1240),
+    "Gujarat": (22.2587, 71.1924),
+    "Haryana": (29.0588, 76.0856),
+    "Himachal Pradesh": (31.1048, 77.1734),
+    "Jammu and Kashmir": (33.7782, 76.5762),
+    "Jharkhand": (23.6102, 85.2799),
+    "Karnataka": (15.3173, 75.7139),
+    "Kerala": (10.8505, 76.2711),
+    "Ladakh": (34.1526, 77.5771),
+    "Lakshadweep": (10.5667, 72.6417),
+    "Madhya Pradesh": (22.9734, 78.6569),
+    "Maharashtra": (19.7515, 75.7139),
+    "Manipur": (24.6637, 93.9063),
+    "Meghalaya": (25.4670, 91.3662),
+    "Mizoram": (23.1645, 92.9376),
+    "Nagaland": (26.1584, 94.5624),
+    "Odisha": (20.9517, 85.0985),
+    "Puducherry": (11.9416, 79.8083),
+    "Punjab": (31.1471, 75.3412),
+    "Rajasthan": (27.0238, 74.2179),
+    "Sikkim": (27.5330, 88.5122),
+    "Tamil Nadu": (11.1271, 78.6569),
+    "Telangana": (18.1124, 79.0193),
+    "Tripura": (23.9408, 91.9882),
+    "Uttar Pradesh": (26.8467, 80.9462),
+    "Uttarakhand": (30.0668, 79.0193),
+    "West Bengal": (22.9868, 87.8550),
+}
+
+
+def get_priority_lookup():
+    return {r["state"]: r for r in engine.rank_all_states()}
+
+
+def build_map_data(data):
+    priority_lookup = get_priority_lookup()
+    map_data = data.copy()
+    map_data["lat"] = map_data["state"].map(lambda state: STATE_COORDS.get(state, (None, None))[0])
+    map_data["lon"] = map_data["state"].map(lambda state: STATE_COORDS.get(state, (None, None))[1])
+    map_data["priority_score"] = map_data["state"].map(lambda state: priority_lookup.get(state, {}).get("score", 0))
+    map_data["priority_category"] = map_data["state"].map(lambda state: priority_lookup.get(state, {}).get("category", "LOW"))
+    return map_data.dropna(subset=["lat", "lon"])
+
+
+def scenario_priority_score(row, budget_pct, added_doctors, added_beds, vaccine_gain, added_icu):
+    population = row["population_crore"] * 10000000
+    population_crore = max(row["population_crore"], 0.01)
+
+    projected_budget = row["health_budget_crore"] * (1 + budget_pct / 100)
+    projected_per_capita = projected_budget / population_crore
+    projected_doctors = row["doctors_total"] + added_doctors
+    projected_doctor_ratio = projected_doctors / population * 1000
+    projected_beds_per_1000 = row["hospital_beds_per_1000"] + added_beds / (population / 1000)
+    projected_vaccine = min(99.0, row["vaccine_coverage_pct"] + vaccine_gain)
+    projected_icu = row["icu_beds"] + added_icu
+
+    infra_improvement = (
+        budget_pct * 0.02
+        + max(0, projected_beds_per_1000 - row["hospital_beds_per_1000"]) * 0.5
+        + max(0, projected_doctor_ratio - row["doctor_per_1000"]) * 0.4
+        + vaccine_gain * 0.03
+    )
+    projected_infra_gap = max(1.0, row["infra_gap_score"] - infra_improvement)
+
+    benchmarks = engine.BENCHMARKS
+    weights = engine.PRIORITY_WEIGHTS
+    required_icu = max(1, population / 100000 * benchmarks["icu_beds_per_100k"])
+    scores = {
+        "doctor_gap": min(1, max(0, 1 - projected_doctor_ratio / benchmarks["doctor_per_1000"])),
+        "bed_gap": min(1, max(0, 1 - projected_beds_per_1000 / benchmarks["hospital_beds_per_1000"])),
+        "vaccine_gap": min(1, max(0, (benchmarks["vaccine_coverage_pct"] - projected_vaccine) / 40)),
+        "budget_gap": min(1, max(0, 1 - projected_per_capita / benchmarks["budget_per_capita_min"])),
+        "mmr_gap": min(1, max(0, (row["maternal_mortality_ratio"] - benchmarks["mmr_target"]) / 150)),
+        "imr_gap": min(1, max(0, (row["infant_mortality_rate"] - benchmarks["imr_target"]) / 40)),
+        "infra_gap": min(1, projected_infra_gap / 10),
+        "icu_gap": min(1, max(0, (required_icu - projected_icu) / required_icu)),
+    }
+    priority_score = sum(scores[key] * weights[key] for key in weights) * 100
+
+    return {
+        "projected_budget": projected_budget,
+        "projected_per_capita": projected_per_capita,
+        "projected_doctor_ratio": projected_doctor_ratio,
+        "projected_beds_per_1000": projected_beds_per_1000,
+        "projected_vaccine": projected_vaccine,
+        "projected_infra_gap": projected_infra_gap,
+        "projected_priority_score": round(priority_score, 1),
+    }
+
+
+def identify_primary_focus(row):
+    gaps = {
+        "Doctor deployment": max(0, 1 - row["doctor_per_1000"] / engine.BENCHMARKS["doctor_per_1000"]),
+        "Hospital beds": max(0, 1 - row["hospital_beds_per_1000"] / engine.BENCHMARKS["hospital_beds_per_1000"]),
+        "Vaccine coverage": max(0, (engine.BENCHMARKS["vaccine_coverage_pct"] - row["vaccine_coverage_pct"]) / 40),
+        "Per-capita budget": max(0, 1 - row["budget_per_capita_inr"] / engine.BENCHMARKS["budget_per_capita_min"]),
+        "Infrastructure": row["infra_gap_score"] / 10,
+    }
+    return max(gaps, key=gaps.get)
+
+
+def optimize_fund_allocation(data, total_fund_crore, priority_weight, population_weight, disease_weight, infra_weight, floor_crore):
+    priority_lookup = get_priority_lookup()
+    allocation = data.copy()
+    allocation["priority_score"] = allocation["state"].map(lambda state: priority_lookup.get(state, {}).get("score", 0))
+    allocation["priority_category"] = allocation["state"].map(lambda state: priority_lookup.get(state, {}).get("category", "LOW"))
+    allocation["primary_focus"] = allocation.apply(identify_primary_focus, axis=1)
+
+    allocation["priority_component"] = allocation["priority_score"] / 100
+    allocation["population_component"] = allocation["population_crore"] / allocation["population_crore"].max()
+    allocation["disease_component"] = allocation["disease_index"] / allocation["disease_index"].max()
+    allocation["infra_component"] = allocation["infra_gap_score"] / 10
+
+    total_weight = max(priority_weight + population_weight + disease_weight + infra_weight, 1)
+    allocation["need_score"] = (
+        allocation["priority_component"] * priority_weight
+        + allocation["population_component"] * population_weight
+        + allocation["disease_component"] * disease_weight
+        + allocation["infra_component"] * infra_weight
+    ) / total_weight
+
+    effective_floor = min(floor_crore, total_fund_crore / max(len(allocation), 1))
+    remaining_fund = max(total_fund_crore - effective_floor * len(allocation), 0)
+    allocation["allocated_fund_crore"] = effective_floor
+    if allocation["need_score"].sum() > 0 and remaining_fund > 0:
+        allocation["allocated_fund_crore"] += remaining_fund * allocation["need_score"] / allocation["need_score"].sum()
+    allocation["allocation_share_pct"] = allocation["allocated_fund_crore"] / max(total_fund_crore, 1) * 100
+
+    return allocation.sort_values("allocated_fund_crore", ascending=False)
+
+
 # -------------------------
 # Load All Data
 # -------------------------
@@ -375,13 +516,15 @@ st.markdown('<p class="subtitle">AI-Powered Decision Support for Healthcare Reso
 # -------------------------
 # Tab Layout
 # -------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab_items = [
     "📊 National Dashboard",
     "🏥 State Deep Dive",
     "🔮 2028-29 Predictions",
     "💡 AI Recommendations",
     "💬 Policy Chat"
-])
+]
+tab_items.insert(4, "Scenario & Allocation")
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_items)
 
 
 # =============================
@@ -413,6 +556,75 @@ with tab1:
     
     st.markdown("")
 
+    st.markdown('<div class="section-header">Interactive India Health Risk Map</div>', unsafe_allow_html=True)
+    map_metric_options = {
+        "Priority Score": "priority_score",
+        "Health Budget": "health_budget_crore",
+        "Doctor Density": "doctor_per_1000",
+        "Hospital Beds": "hospital_beds_per_1000",
+        "Vaccine Coverage": "vaccine_coverage_pct",
+        "Infrastructure Gap": "infra_gap_score",
+    }
+    col_map_control, col_map_note = st.columns([1, 2])
+    with col_map_control:
+        selected_map_metric = st.selectbox(
+            "Map metric",
+            list(map_metric_options.keys()),
+            key="national_map_metric"
+        )
+    with col_map_note:
+        st.markdown(
+            "Use the map to scan state-level pressure points. Circle size reflects population; color reflects the selected metric."
+        )
+
+    map_data = build_map_data(latest_data)
+    selected_metric_col = map_metric_options[selected_map_metric]
+    color_scale = "RdYlGn_r" if selected_metric_col in ["priority_score", "infra_gap_score"] else "Tealgrn"
+    fig = px.scatter_map(
+        map_data,
+        lat="lat",
+        lon="lon",
+        color=selected_metric_col,
+        size="population_crore",
+        hover_name="state",
+        hover_data={
+            "lat": False,
+            "lon": False,
+            "population_crore": ":.2f",
+            "priority_score": ":.1f",
+            "priority_category": True,
+            "health_budget_crore": ":,.0f",
+            "doctor_per_1000": ":.2f",
+            "hospital_beds_per_1000": ":.2f",
+            "vaccine_coverage_pct": ":.1f",
+            "infra_gap_score": ":.1f",
+        },
+        color_continuous_scale=color_scale,
+        labels={
+            selected_metric_col: selected_map_metric,
+            "population_crore": "Population (Cr)",
+            "priority_score": "Priority Score",
+            "priority_category": "Priority",
+            "health_budget_crore": "Budget (Cr)",
+            "doctor_per_1000": "Doctors/1000",
+            "hospital_beds_per_1000": "Beds/1000",
+            "vaccine_coverage_pct": "Vaccine %",
+            "infra_gap_score": "Infra Gap",
+        },
+        zoom=3.8,
+        center={"lat": 22.5, "lon": 82.5},
+        map_style="open-street-map",
+    )
+    fig.update_layout(
+        height=560,
+        margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#CAF0F8"),
+        coloraxis_colorbar=dict(title=selected_map_metric),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
     # Charts Row 1
     col1, col2 = st.columns(2)
     
@@ -435,7 +647,7 @@ with tab1:
             coloraxis_showscale=False,
             margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.markdown('<div class="section-header">State-wise Infrastructure Gap Score</div>', unsafe_allow_html=True)
@@ -456,7 +668,7 @@ with tab1:
             coloraxis_showscale=False,
             margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     # Charts Row 2
     col1, col2 = st.columns(2)
@@ -480,7 +692,7 @@ with tab1:
             yaxis=dict(gridcolor='rgba(144,224,239,0.1)'),
             margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.markdown('<div class="section-header">Vaccine Coverage by State (%)</div>', unsafe_allow_html=True)
@@ -501,7 +713,7 @@ with tab1:
             yaxis=dict(gridcolor='rgba(144,224,239,0.1)'),
             margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     # National Budget Trend
     st.markdown('<div class="section-header">National Health Budget Trend (2020-2027)</div>', unsafe_allow_html=True)
@@ -520,7 +732,7 @@ with tab1:
         margin=dict(l=0, r=0, t=10, b=0)
     )
     fig.update_traces(fill='tozeroy', line=dict(width=3))
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # =============================
@@ -622,7 +834,7 @@ with tab2:
             legend=dict(x=0.8, y=1.15),
             margin=dict(l=30, r=30, t=30, b=30)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.markdown('<div class="section-header">Gap Analysis</div>', unsafe_allow_html=True)
@@ -671,7 +883,7 @@ with tab2:
             legend=dict(x=0, y=1.15, orientation='h'),
             margin=dict(l=0, r=0, t=40, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     with trend_col2:
         fig = go.Figure()
@@ -694,7 +906,7 @@ with tab2:
             legend=dict(x=0, y=1.15, orientation='h'),
             margin=dict(l=0, r=0, t=40, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     # State Comparison
     if compare_state != "None":
@@ -719,7 +931,7 @@ with tab2:
                     compare_state: vals[compare_state],
                     'Better': '✅ ' + vals['better']
                 })
-            st.dataframe(pd.DataFrame(comp_data), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
 
 
 # =============================
@@ -830,7 +1042,7 @@ with tab3:
                     legend=dict(x=0, y=1.1, orientation='h'),
                     margin=dict(l=0, r=0, t=40, b=0)
                 )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
 
             with col2:
                 # Doctors trajectory
@@ -854,7 +1066,7 @@ with tab3:
                     legend=dict(x=0, y=1.1, orientation='h'),
                     margin=dict(l=0, r=0, t=40, b=0)
                 )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
 
         # All States Overview
         st.markdown('<div class="section-header">All States — Budget Predictions 2028</div>', unsafe_allow_html=True)
@@ -873,7 +1085,7 @@ with tab3:
             coloraxis_showscale=False,
             margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning("Predictions not available. Run `train_predictors.py` first.")
 
@@ -926,7 +1138,7 @@ with tab4:
                 yaxis=dict(gridcolor='rgba(144,224,239,0.1)'),
                 margin=dict(l=0, r=0, t=40, b=0)
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
             
             # Recommendations
             st.markdown(f'<div class="section-header">Action Items for {rec_state}</div>', unsafe_allow_html=True)
@@ -957,9 +1169,223 @@ with tab4:
 
 
 # =============================
-# TAB 5: Policy Chat (SLM + RAG)
+# TAB 5: Scenario Simulator & Fund Allocation
 # =============================
 with tab5:
+    st.markdown('<div class="section-header">Scenario Simulator</div>', unsafe_allow_html=True)
+
+    sim_col, impact_col = st.columns([1, 2])
+    with sim_col:
+        scenario_state = st.selectbox("State", states_list, key="scenario_state")
+        budget_increase_pct = st.slider("Budget increase (%)", 0, 100, 20, step=5)
+        added_doctors = st.number_input("Additional doctors", min_value=0, max_value=500000, value=2500, step=500)
+        added_beds = st.number_input("Additional hospital beds", min_value=0, max_value=500000, value=5000, step=500)
+        added_icu = st.number_input("Additional ICU beds", min_value=0, max_value=100000, value=500, step=100)
+        vaccine_gain = st.slider("Vaccine coverage gain (percentage points)", 0.0, 25.0, 5.0, step=0.5)
+
+    scenario_row = latest_data[latest_data["state"] == scenario_state].iloc[0]
+    baseline = scenario_priority_score(scenario_row, 0, 0, 0, 0, 0)
+    scenario = scenario_priority_score(
+        scenario_row,
+        budget_increase_pct,
+        added_doctors,
+        added_beds,
+        vaccine_gain,
+        added_icu,
+    )
+
+    incremental_budget = scenario["projected_budget"] - scenario_row["health_budget_crore"]
+    estimated_doctor_cost = added_doctors * 12 / 100
+    estimated_bed_cost = added_beds * 0.25
+    estimated_icu_cost = added_icu * 0.6
+    estimated_vaccine_cost = scenario_row["population_crore"] * vaccine_gain * 8
+    estimated_total_cost = incremental_budget + estimated_doctor_cost + estimated_bed_cost + estimated_icu_cost + estimated_vaccine_cost
+
+    with impact_col:
+        st.markdown(f"### {scenario_state} scenario impact")
+        impact_cards = st.columns(4)
+        with impact_cards[0]:
+            st.markdown(
+                render_metric_card(
+                    "Priority Score",
+                    f"{scenario['projected_priority_score']:.1f}",
+                    f"{baseline['projected_priority_score'] - scenario['projected_priority_score']:+.1f} improvement"
+                ),
+                unsafe_allow_html=True,
+            )
+        with impact_cards[1]:
+            st.markdown(
+                render_metric_card(
+                    "Budget",
+                    f"Rs {scenario['projected_budget']:,.0f} Cr",
+                    f"+Rs {incremental_budget:,.0f} Cr"
+                ),
+                unsafe_allow_html=True,
+            )
+        with impact_cards[2]:
+            st.markdown(
+                render_metric_card(
+                    "Doctors/1000",
+                    f"{scenario['projected_doctor_ratio']:.2f}",
+                    f"from {scenario_row['doctor_per_1000']:.2f}"
+                ),
+                unsafe_allow_html=True,
+            )
+        with impact_cards[3]:
+            st.markdown(
+                render_metric_card(
+                    "Beds/1000",
+                    f"{scenario['projected_beds_per_1000']:.2f}",
+                    f"from {scenario_row['hospital_beds_per_1000']:.2f}"
+                ),
+                unsafe_allow_html=True,
+            )
+
+        scenario_chart = pd.DataFrame({
+            "Metric": ["Priority Score", "Doctors/1000", "Beds/1000", "Vaccine Coverage", "Infra Gap"],
+            "Current": [
+                baseline["projected_priority_score"],
+                scenario_row["doctor_per_1000"],
+                scenario_row["hospital_beds_per_1000"],
+                scenario_row["vaccine_coverage_pct"],
+                scenario_row["infra_gap_score"],
+            ],
+            "Scenario": [
+                scenario["projected_priority_score"],
+                scenario["projected_doctor_ratio"],
+                scenario["projected_beds_per_1000"],
+                scenario["projected_vaccine"],
+                scenario["projected_infra_gap"],
+            ],
+        })
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Current", x=scenario_chart["Metric"], y=scenario_chart["Current"], marker_color="#00B4D8"))
+        fig.add_trace(go.Bar(name="Scenario", x=scenario_chart["Metric"], y=scenario_chart["Scenario"], marker_color="#00B894"))
+        fig.update_layout(
+            barmode="group",
+            height=360,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#CAF0F8"),
+            xaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
+            yaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
+            legend=dict(orientation="h", y=1.08),
+            margin=dict(l=0, r=0, t=35, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.info(
+            f"Estimated scenario investment: Rs {estimated_total_cost:,.0f} crore. "
+            f"The model estimates infrastructure gap moving from {scenario_row['infra_gap_score']:.1f} to {scenario['projected_infra_gap']:.1f}."
+        )
+
+    st.markdown('<div class="section-header">National Fund Allocation Optimizer</div>', unsafe_allow_html=True)
+
+    opt_col, weight_col = st.columns([1, 2])
+    with opt_col:
+        total_allocation_budget = st.number_input(
+            "Additional national fund pool (Rs crore)",
+            min_value=1000,
+            max_value=1000000,
+            value=50000,
+            step=1000,
+        )
+        floor_allocation = st.number_input(
+            "Minimum allocation per state/UT (Rs crore)",
+            min_value=0,
+            max_value=10000,
+            value=100,
+            step=50,
+        )
+    with weight_col:
+        weight_cols = st.columns(4)
+        with weight_cols[0]:
+            priority_weight = st.slider("Priority weight", 0.0, 1.0, 0.45, step=0.05)
+        with weight_cols[1]:
+            population_weight = st.slider("Population weight", 0.0, 1.0, 0.25, step=0.05)
+        with weight_cols[2]:
+            disease_weight = st.slider("Disease burden weight", 0.0, 1.0, 0.15, step=0.05)
+        with weight_cols[3]:
+            infra_weight = st.slider("Infra gap weight", 0.0, 1.0, 0.15, step=0.05)
+
+    allocation = optimize_fund_allocation(
+        latest_data,
+        total_allocation_budget,
+        priority_weight,
+        population_weight,
+        disease_weight,
+        infra_weight,
+        floor_allocation,
+    )
+
+    top_allocations = allocation.head(15).sort_values("allocated_fund_crore", ascending=True)
+    fig = px.bar(
+        top_allocations,
+        x="allocated_fund_crore",
+        y="state",
+        orientation="h",
+        color="priority_score",
+        color_continuous_scale="RdYlGn_r",
+        labels={
+            "allocated_fund_crore": "Allocation (Rs crore)",
+            "state": "",
+            "priority_score": "Priority Score",
+        },
+        hover_data={
+            "priority_category": True,
+            "population_crore": ":.2f",
+            "infra_gap_score": ":.1f",
+            "primary_focus": True,
+        },
+    )
+    fig.update_layout(
+        height=460,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#CAF0F8"),
+        xaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
+        yaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
+        margin=dict(l=0, r=0, t=10, b=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    allocation_display = allocation[[
+        "state",
+        "allocated_fund_crore",
+        "allocation_share_pct",
+        "priority_score",
+        "priority_category",
+        "population_crore",
+        "infra_gap_score",
+        "disease_index",
+        "primary_focus",
+    ]].copy()
+    allocation_display["allocated_fund_crore"] = allocation_display["allocated_fund_crore"].round(0).astype(int)
+    allocation_display["allocation_share_pct"] = allocation_display["allocation_share_pct"].round(2)
+    allocation_display["priority_score"] = allocation_display["priority_score"].round(1)
+    allocation_display = allocation_display.rename(columns={
+        "state": "State",
+        "allocated_fund_crore": "Allocation (Rs Cr)",
+        "allocation_share_pct": "Share %",
+        "priority_score": "Priority Score",
+        "priority_category": "Priority",
+        "population_crore": "Population (Cr)",
+        "infra_gap_score": "Infra Gap",
+        "disease_index": "Disease Index",
+        "primary_focus": "Primary Focus",
+    })
+    st.dataframe(allocation_display, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download allocation plan CSV",
+        data=allocation_display.to_csv(index=False).encode("utf-8"),
+        file_name="fund_allocation_plan.csv",
+        mime="text/csv",
+    )
+
+
+# =============================
+# TAB 6: Policy Chat (SLM + RAG)
+# =============================
+with tab6:
     st.markdown('<div class="section-header">💬 Healthcare Policy AI Chat</div>', unsafe_allow_html=True)
     st.markdown("*Ask questions about state healthcare, budgets, vaccines, supply chain & more. AI uses RAG + ML predictions.*")
     
