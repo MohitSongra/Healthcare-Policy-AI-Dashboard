@@ -431,31 +431,54 @@ def identify_primary_focus(row):
     return max(gaps, key=gaps.get)
 
 
-def optimize_fund_allocation(data, total_fund_crore, priority_weight, population_weight, disease_weight, infra_weight, floor_crore):
+def optimize_fund_allocation(data, total_fund_crore, priority_weight, disease_weight, infra_weight, op_continuity_pct, floor_crore):
     priority_lookup = get_priority_lookup()
     allocation = data.copy()
     allocation["priority_score"] = allocation["state"].map(lambda state: priority_lookup.get(state, {}).get("score", 0))
     allocation["priority_category"] = allocation["state"].map(lambda state: priority_lookup.get(state, {}).get("category", "LOW"))
     allocation["primary_focus"] = allocation.apply(identify_primary_focus, axis=1)
 
+    # 1. Guaranteed Floor Allocation
+    effective_floor = min(floor_crore, total_fund_crore / max(len(allocation), 1))
+    allocated_floor = effective_floor * len(allocation)
+    remaining_fund = max(total_fund_crore - allocated_floor, 0)
+
+    # Split the remaining fund pool
+    pool_a_total = remaining_fund * (op_continuity_pct / 100)
+    pool_b_total = remaining_fund * (1 - op_continuity_pct / 100)
+
+    # 2. Pool A: Operational Continuity (Based on existing infrastructure size)
+    # Estimate total bed count: beds/1000 * (population_crore * 10000000 / 1000)
+    # Which simplifies to: beds/1000 * population_crore * 10000
+    state_beds = allocation["hospital_beds_per_1000"] * allocation["population_crore"] * 10000
+    total_beds = max(1.0, state_beds.sum())
+    total_doctors = max(1.0, allocation["doctors_total"].sum())
+
+    state_beds_share = state_beds / total_beds
+    state_doctors_share = allocation["doctors_total"] / total_doctors
+    
+    # Combined operational size index (50% doctor capacity, 50% bed capacity)
+    allocation["pool_a_share"] = state_beds_share * 0.5 + state_doctors_share * 0.5
+    allocation["pool_a_allocation"] = pool_a_total * allocation["pool_a_share"]
+
+    # 3. Pool B: Development & Equity (Based on priority, disease and infra weights)
     allocation["priority_component"] = allocation["priority_score"] / 100
-    allocation["population_component"] = allocation["population_crore"] / allocation["population_crore"].max()
-    allocation["disease_component"] = allocation["disease_index"] / allocation["disease_index"].max()
+    allocation["disease_component"] = allocation["disease_index"] / max(0.01, allocation["disease_index"].max())
     allocation["infra_component"] = allocation["infra_gap_score"] / 10
 
-    total_weight = max(priority_weight + population_weight + disease_weight + infra_weight, 1)
-    allocation["need_score"] = (
+    total_weight = max(priority_weight + disease_weight + infra_weight, 1)
+    need_score = (
         allocation["priority_component"] * priority_weight
-        + allocation["population_component"] * population_weight
         + allocation["disease_component"] * disease_weight
         + allocation["infra_component"] * infra_weight
     ) / total_weight
 
-    effective_floor = min(floor_crore, total_fund_crore / max(len(allocation), 1))
-    remaining_fund = max(total_fund_crore - effective_floor * len(allocation), 0)
-    allocation["allocated_fund_crore"] = effective_floor
-    if allocation["need_score"].sum() > 0 and remaining_fund > 0:
-        allocation["allocated_fund_crore"] += remaining_fund * allocation["need_score"] / allocation["need_score"].sum()
+    total_need_score = max(0.01, need_score.sum())
+    allocation["pool_b_share"] = need_score / total_need_score
+    allocation["pool_b_allocation"] = pool_b_total * allocation["pool_b_share"]
+
+    # 4. Total Combined Fund
+    allocation["allocated_fund_crore"] = effective_floor + allocation["pool_a_allocation"] + allocation["pool_b_allocation"]
     allocation["allocation_share_pct"] = allocation["allocated_fund_crore"] / max(total_fund_crore, 1) * 100
 
     return allocation.sort_values("allocated_fund_crore", ascending=False)
@@ -1353,61 +1376,102 @@ with tab5:
             value=100,
             step=50,
         )
+        op_continuity_pct = st.slider(
+            "Operational Continuity Share (Pool A %)",
+            min_value=50,
+            max_value=90,
+            value=70,
+            step=5,
+            help="Percentage of the remaining budget (after floor guarantees) allocated to maintain existing healthcare infrastructure scale (Pool A). The rest goes to development (Pool B)."
+        )
     with weight_col:
-        weight_cols = st.columns(4)
+        st.markdown("##### Development & Equity Weights (Pool B)")
+        weight_cols = st.columns(3)
         with weight_cols[0]:
-            priority_weight = st.slider("Priority weight", 0.0, 1.0, 0.45, step=0.05)
+            priority_weight = st.slider("Priority weight", 0.0, 1.0, 0.50, step=0.05)
         with weight_cols[1]:
-            population_weight = st.slider("Population weight", 0.0, 1.0, 0.25, step=0.05)
+            disease_weight = st.slider("Disease burden weight", 0.0, 1.0, 0.25, step=0.05)
         with weight_cols[2]:
-            disease_weight = st.slider("Disease burden weight", 0.0, 1.0, 0.15, step=0.05)
-        with weight_cols[3]:
-            infra_weight = st.slider("Infra gap weight", 0.0, 1.0, 0.15, step=0.05)
+            infra_weight = st.slider("Infra gap weight", 0.0, 1.0, 0.25, step=0.05)
+
+    # Calculate Pool sizes for display
+    effective_floor_val = min(floor_allocation, total_allocation_budget / len(latest_data))
+    allocated_floor_total = effective_floor_val * len(latest_data)
+    remaining_fund_total = max(0, total_allocation_budget - allocated_floor_total)
+    pool_a_total_val = remaining_fund_total * (op_continuity_pct / 100)
+    pool_b_total_val = remaining_fund_total * (1 - op_continuity_pct / 100)
+
+    st.markdown(
+        f'<div style="font-size:0.88rem; color:#CAF0F8; background-color:rgba(0,180,216,0.1); padding:12px; border-radius:5px; margin-bottom:20px; border-left:4px solid #00B4D8; line-height:1.4;">'
+        f'<b>🎯 Fund Pool Split Details:</b><br>'
+        f'• Base Floor Guarantee: <b>₹{allocated_floor_total:,.0f} Cr</b> (₹{effective_floor_val:.0f} Cr/state)<br>'
+        f'• Pool A (Operational Continuity - {op_continuity_pct}%): <b>₹{pool_a_total_val:,.0f} Cr</b> (Based on active doctors & beds to sustain baseline operations)<br>'
+        f'• Pool B (Development & Equity - {100-op_continuity_pct}%): <b>₹{pool_b_total_val:,.0f} Cr</b> (Distributed based on priority weights to target gaps)'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
     allocation = optimize_fund_allocation(
         latest_data,
         total_allocation_budget,
         priority_weight,
-        population_weight,
         disease_weight,
         infra_weight,
+        op_continuity_pct,
         floor_allocation,
     )
 
-    top_allocations = allocation.head(15).sort_values("allocated_fund_crore", ascending=True)
+    # Horizontal Stacked Bar Chart for Top 15 Allocations
+    top_allocations = allocation.head(15).copy()
+    top_allocations["Floor Guarantee"] = effective_floor_val
+    top_allocations = top_allocations.rename(columns={
+        "pool_a_allocation": "Pool A (Operational)",
+        "pool_b_allocation": "Pool B (Development)",
+    })
+
+    melted = top_allocations.melt(
+        id_vars=["state"],
+        value_vars=["Floor Guarantee", "Pool A (Operational)", "Pool B (Development)"],
+        var_name="Allocation Type",
+        value_name="Amount (Rs Crore)"
+    )
+
     fig = px.bar(
-        top_allocations,
-        x="allocated_fund_crore",
+        melted,
+        x="Amount (Rs Crore)",
         y="state",
+        color="Allocation Type",
         orientation="h",
-        color="priority_score",
-        color_continuous_scale="RdYlGn_r",
+        color_discrete_map={
+            "Floor Guarantee": "#7209B7",
+            "Pool A (Operational)": "#4361EE",
+            "Pool B (Development)": "#4CC9F0",
+        },
         labels={
-            "allocated_fund_crore": "Allocation (Rs crore)",
             "state": "",
-            "priority_score": "Priority Score",
+            "Amount (Rs Crore)": "Allocation (Rs Crore)"
         },
-        hover_data={
-            "priority_category": True,
-            "population_crore": ":.2f",
-            "infra_gap_score": ":.1f",
-            "primary_focus": True,
-        },
+        title="Top 15 State Fund Allocation Breakdown (Rs Crore)"
     )
     fig.update_layout(
-        height=460,
+        barmode="stack",
+        height=480,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#CAF0F8"),
         xaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
-        yaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
-        margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(gridcolor="rgba(144,224,239,0.1)", categoryorder="total ascending"),
+        margin=dict(l=0, r=0, t=35, b=0),
+        legend=dict(orientation="h", y=1.08),
     )
     st.plotly_chart(fig, use_container_width=True)
 
+    # Detailed Table columns showing Two-Pool splits
     allocation_display = allocation[[
         "state",
         "allocated_fund_crore",
+        "pool_a_allocation",
+        "pool_b_allocation",
         "allocation_share_pct",
         "priority_score",
         "priority_category",
@@ -1416,12 +1480,19 @@ with tab5:
         "disease_index",
         "primary_focus",
     ]].copy()
+    allocation_display["allocated_floor_cr"] = (allocation_display["allocated_fund_crore"] - allocation_display["pool_a_allocation"] - allocation_display["pool_b_allocation"]).round(0).astype(int)
     allocation_display["allocated_fund_crore"] = allocation_display["allocated_fund_crore"].round(0).astype(int)
+    allocation_display["pool_a_allocation"] = allocation_display["pool_a_allocation"].round(0).astype(int)
+    allocation_display["pool_b_allocation"] = allocation_display["pool_b_allocation"].round(0).astype(int)
     allocation_display["allocation_share_pct"] = allocation_display["allocation_share_pct"].round(2)
     allocation_display["priority_score"] = allocation_display["priority_score"].round(1)
+
     allocation_display = allocation_display.rename(columns={
         "state": "State",
-        "allocated_fund_crore": "Allocation (Rs Cr)",
+        "allocated_fund_crore": "Total Allocation (Rs Cr)",
+        "pool_a_allocation": "Pool A (Continuity)",
+        "pool_b_allocation": "Pool B (Equity)",
+        "allocated_floor_cr": "Floor Guarantee",
         "allocation_share_pct": "Share %",
         "priority_score": "Priority Score",
         "priority_category": "Priority",
