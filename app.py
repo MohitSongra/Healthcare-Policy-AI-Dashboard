@@ -1177,13 +1177,36 @@ with tab5:
     sim_col, impact_col = st.columns([1, 2])
     with sim_col:
         scenario_state = st.selectbox("State", states_list, key="scenario_state")
+        scenario_row = latest_data[latest_data["state"] == scenario_state].iloc[0]
+        
+        # Calculate baseline quantities
+        pop_1000 = max(0.01, (scenario_row["population_crore"] * 10000000) / 1000)
+        curr_doctors = int(max(0, scenario_row["doctors_total"]))
+        curr_beds = int(max(0, scenario_row["hospital_beds_per_1000"] * pop_1000))
+        curr_icu = int(max(0, scenario_row["icu_beds"]))
+
         budget_increase_pct = st.slider("Budget increase (%)", 0, 100, 20, step=5)
-        added_doctors = st.number_input("Additional doctors", min_value=0, max_value=500000, value=2500, step=500)
-        added_beds = st.number_input("Additional hospital beds", min_value=0, max_value=500000, value=5000, step=500)
-        added_icu = st.number_input("Additional ICU beds", min_value=0, max_value=100000, value=500, step=100)
+        
+        st.markdown("##### Resource Increase (%)")
+        doctor_pct_gain = st.slider("Doctors (% increase)", 0, 500, 10, step=5)
+        beds_pct_gain = st.slider("Hospital Beds (% increase)", 0, 500, 10, step=5)
+        icu_pct_gain = st.slider("ICU Beds (% increase)", 0, 500, 10, step=5)
+
+        added_doctors = int(curr_doctors * (doctor_pct_gain / 100))
+        added_beds = int(curr_beds * (beds_pct_gain / 100))
+        added_icu = int(curr_icu * (icu_pct_gain / 100))
+
+        st.markdown(
+            f'<div style="font-size:0.82rem; color:#85E3FF; line-height:1.3; margin-top:5px; margin-bottom:10px;">'
+            f'<b>Calculated Resource Additions:</b><br>'
+            f'• Doctors: <b>+{added_doctors:,}</b> (total {curr_doctors + added_doctors:,})<br>'
+            f'• Beds: <b>+{added_beds:,}</b> (total {curr_beds + added_beds:,})<br>'
+            f'• ICU Beds: <b>+{added_icu:,}</b> (total {curr_icu + added_icu:,})'
+            f'</div>',
+            unsafe_allow_html=True
+        )
         vaccine_gain = st.slider("Vaccine coverage gain (percentage points)", 0.0, 25.0, 5.0, step=0.5)
 
-    scenario_row = latest_data[latest_data["state"] == scenario_state].iloc[0]
     baseline = scenario_priority_score(scenario_row, 0, 0, 0, 0, 0)
     scenario = scenario_priority_score(
         scenario_row,
@@ -1241,35 +1264,69 @@ with tab5:
                 unsafe_allow_html=True,
             )
 
-        scenario_chart = pd.DataFrame({
+        # Build normalized chart
+        chart_df = pd.DataFrame({
             "Metric": ["Priority Score", "Doctors/1000", "Beds/1000", "Vaccine Coverage", "Infra Gap"],
-            "Current": [
+            "Current_Pct": [
                 baseline["projected_priority_score"],
-                scenario_row["doctor_per_1000"],
-                scenario_row["hospital_beds_per_1000"],
+                (scenario_row["doctor_per_1000"] / 1.0) * 100,
+                (scenario_row["hospital_beds_per_1000"] / 3.0) * 100,
                 scenario_row["vaccine_coverage_pct"],
-                scenario_row["infra_gap_score"],
+                scenario_row["infra_gap_score"] * 10,
             ],
-            "Scenario": [
+            "Scenario_Pct": [
                 scenario["projected_priority_score"],
-                scenario["projected_doctor_ratio"],
-                scenario["projected_beds_per_1000"],
+                (scenario["projected_doctor_ratio"] / 1.0) * 100,
+                (scenario["projected_beds_per_1000"] / 3.0) * 100,
                 scenario["projected_vaccine"],
-                scenario["projected_infra_gap"],
+                scenario["projected_infra_gap"] * 10,
             ],
+            "Current_Raw": [
+                f"{baseline['projected_priority_score']:.1f}",
+                f"{scenario_row['doctor_per_1000']:.2f}",
+                f"{scenario_row['hospital_beds_per_1000']:.2f}",
+                f"{scenario_row['vaccine_coverage_pct']:.1f}%",
+                f"{scenario_row['infra_gap_score']:.1f}",
+            ],
+            "Scenario_Raw": [
+                f"{scenario['projected_priority_score']:.1f}",
+                f"{scenario['projected_doctor_ratio']:.2f}",
+                f"{scenario['projected_beds_per_1000']:.2f}",
+                f"{scenario['projected_vaccine']:.1f}%",
+                f"{scenario['projected_infra_gap']:.1f}",
+            ]
         })
+
         fig = go.Figure()
-        fig.add_trace(go.Bar(name="Current", x=scenario_chart["Metric"], y=scenario_chart["Current"], marker_color="#00B4D8"))
-        fig.add_trace(go.Bar(name="Scenario", x=scenario_chart["Metric"], y=scenario_chart["Scenario"], marker_color="#00B894"))
+        fig.add_trace(go.Bar(
+            name="Current",
+            x=chart_df["Metric"],
+            y=chart_df["Current_Pct"],
+            text=chart_df["Current_Raw"],
+            textposition="outside",
+            marker_color="#00B4D8"
+        ))
+        fig.add_trace(go.Bar(
+            name="Scenario",
+            x=chart_df["Metric"],
+            y=chart_df["Scenario_Pct"],
+            text=chart_df["Scenario_Raw"],
+            textposition="outside",
+            marker_color="#00B894"
+        ))
         fig.update_layout(
             barmode="group",
-            height=360,
+            height=380,
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#CAF0F8"),
             xaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
-            yaxis=dict(gridcolor="rgba(144,224,239,0.1)"),
-            legend=dict(orientation="h", y=1.08),
+            yaxis=dict(
+                title="Percentage (%) of Benchmark/Target",
+                gridcolor="rgba(144,224,239,0.1)",
+                range=[0, max(chart_df["Current_Pct"].max(), chart_df["Scenario_Pct"].max()) * 1.18]
+            ),
+            legend=dict(orientation="h", y=1.12),
             margin=dict(l=0, r=0, t=35, b=0),
         )
         st.plotly_chart(fig, use_container_width=True)
